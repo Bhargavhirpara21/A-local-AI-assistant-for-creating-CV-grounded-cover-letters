@@ -7,7 +7,8 @@ Verified on 24 July 2026 with Python 3.12.10.
 - `claude-agent-sdk==0.2.126`
 - `streamlit==1.60.0`
 - `openpyxl==3.1.5`
-- Claude Code CLI `2.1.185`
+- System npm Claude Code CLI `2.1.185`
+- SDK-bundled native Claude Code CLI `2.1.218`
 
 ## Claude Agent SDK options
 
@@ -69,7 +70,18 @@ The installed package also exposes the expected exception classes:
 `CLINotFoundError`, `CLIConnectionError`, `ProcessError`,
 `CLIJSONDecodeError`, and `ClaudeSDKError`. No SDK fallback is required.
 
-The explicit CLI executable
-`C:\Users\fk6147\AppData\Roaming\npm\claude.cmd` works. Configuration keeps
-`cli_path=None` initially so SDK auto-detection is exercised in the Phase 4
-subscription smoke test; the explicit path remains the documented fallback.
+The installed SDK contains its supported native Windows executable at
+`.venv\Lib\site-packages\claude_agent_sdk\_bundled\claude.exe` and prefers it
+when `cli_path=None`.
+
+Although the npm `claude.cmd` shim works when invoked directly from PowerShell,
+SDK 0.2.126 deliberately rejects `.cmd` and `.bat` values for `cli_path`.
+Configuration therefore keeps `cli_path=None`. If an explicit override is ever
+needed, it must point to a native `claude.exe`, never a batch shim.
+
+## Subscription smoke result
+
+With `ANTHROPIC_API_KEY` unset, both the inherited default model and explicit
+`model="haiku"` returned exactly `OK` through `AgentSDKClient` on 24 July 2026.
+The live calls required network execution outside the restricted development
+sandbox; no API key was used.

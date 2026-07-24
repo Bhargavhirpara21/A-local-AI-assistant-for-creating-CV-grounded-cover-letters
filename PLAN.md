@@ -35,6 +35,10 @@ The approved changes are:
 8. The revised implementation order is the phase sequence in
    `ARCHITECTURE.md`. Each phase has an explicit verify gate and is committed
    and pushed before the next phase starts.
+9. Installed Agent SDK 0.2.126 bundles a native Windows `claude.exe` and
+   rejects `.cmd`/`.bat` values for `cli_path`. Keep `cli_path=None` to use the
+   bundled executable, or configure a native `.exe`; the older `.cmd` fallback
+   guidance later in this original guide is superseded.
 
 Where this amendment or `ARCHITECTURE.md` conflicts with a later section of
 this original guide, the amendment and architecture take precedence. Sections

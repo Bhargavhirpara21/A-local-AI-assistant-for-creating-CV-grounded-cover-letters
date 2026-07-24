@@ -97,16 +97,20 @@ class ClientFactoryTests(unittest.TestCase):
 
         fake_module = types.ModuleType("llm.agent_sdk_client")
         fake_module.AgentSDKClient = FakeAgentClient  # type: ignore[attr-defined]
-
-        with patch.dict(
-            sys.modules,
-            {"llm.agent_sdk_client": fake_module},
-        ):
-            client = get_client(self.settings)
+        previous_api_module = sys.modules.pop("llm.anthropic_api_client", None)
+        try:
+            with patch.dict(
+                sys.modules,
+                {"llm.agent_sdk_client": fake_module},
+            ):
+                client = get_client(self.settings)
+                self.assertNotIn("llm.anthropic_api_client", sys.modules)
+        finally:
+            if previous_api_module is not None:
+                sys.modules["llm.anthropic_api_client"] = previous_api_module
 
         self.assertIsInstance(client, FakeAgentClient)
         self.assertEqual(captured, [self.settings])
-        self.assertNotIn("llm.anthropic_api_client", sys.modules)
 
     def test_anthropic_branch_is_lazy_and_receives_settings(self) -> None:
         """Selecting API mode should not import the Agent SDK adapter."""
@@ -125,16 +129,20 @@ class ClientFactoryTests(unittest.TestCase):
             self.settings,
             backend="anthropic_api",
         )
-
-        with patch.dict(
-            sys.modules,
-            {"llm.anthropic_api_client": fake_module},
-        ):
-            client = get_client(api_settings)
+        previous_agent_module = sys.modules.pop("llm.agent_sdk_client", None)
+        try:
+            with patch.dict(
+                sys.modules,
+                {"llm.anthropic_api_client": fake_module},
+            ):
+                client = get_client(api_settings)
+                self.assertNotIn("llm.agent_sdk_client", sys.modules)
+        finally:
+            if previous_agent_module is not None:
+                sys.modules["llm.agent_sdk_client"] = previous_agent_module
 
         self.assertIsInstance(client, FakeAPIClient)
         self.assertEqual(captured, [api_settings])
-        self.assertNotIn("llm.agent_sdk_client", sys.modules)
 
     def test_invalid_backend_fails_before_importing_an_adapter(self) -> None:
         """Unknown configuration should raise one clear error immediately."""
