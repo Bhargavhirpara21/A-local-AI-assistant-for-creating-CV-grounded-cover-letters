@@ -1,0 +1,19 @@
+# Environments and Python caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local tooling and secrets
+.streamlit/secrets.toml
+*.log
+*.tmp
+~$*
+
+# Personal and generated data — never commit
+data/
+letters/
+prompts/style_examples/*
+!prompts/style_examples/README.md

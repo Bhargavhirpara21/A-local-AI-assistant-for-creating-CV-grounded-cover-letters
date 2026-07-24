@@ -1,0 +1,1 @@
+"""Core AutoCover business logic."""

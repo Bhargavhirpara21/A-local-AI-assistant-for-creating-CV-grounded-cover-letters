@@ -1,0 +1,3 @@
+streamlit>=1.40
+claude-agent-sdk
+openpyxl>=3.1
