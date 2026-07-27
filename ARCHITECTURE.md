@@ -85,8 +85,12 @@ backend is implemented.
 
 `core/archive.py` saves every generated and refined letter to `letters/`.
 Front matter stores parsed metadata, application ID, timestamps, refinement
-state, source hash, and research URLs. The full job description is retained in
-a collapsed details block. Paths are legal on Windows and collision-safe.
+state, source-library hash, exact-input hash, and research URLs. The full job
+description is retained in a collapsed details block. A collision-matched
+`.trace.json` file stores the exact system and user prompts, operation, backend,
+and model used. Both files are private and Git-ignored. The snapshot makes a
+request auditable and replayable, not deterministically reproducible. Paths are
+legal on Windows and collision-safe.
 
 ### Excel tracker
 
@@ -108,7 +112,8 @@ a collapsed details block. Paths are legal on Windows and collision-safe.
 13. `contact_person`
 14. `letter_path`
 15. `source_hash`
-16. `notes`
+16. `input_hash`
+17. `notes`
 
 The initial successful generation creates one row with status `Draft`.
 Refinement updates the same row and letter path. Automated updates preserve
@@ -118,9 +123,9 @@ and never corrupts the existing file.
 
 ### Streamlit application
 
-`app.py` contains four workflows:
+`app.py` exposes four workflows through a collapsible sidebar:
 
-- **New letter:** vacancy, optional URL/notes, language, research, generation,
+- **Create letter:** vacancy, optional URL/notes, language, research, generation,
   grounding, editing, copy view, and refinement.
 - **Applications:** current workbook rows with editable status, applied date,
   and notes.
@@ -130,6 +135,20 @@ and never corrupts the existing file.
 
 Durable rerun state is kept in `st.session_state`. Dependencies are constructed
 once per session and passed to workflow functions.
+
+The primary flow is one vertical sequence: paste vacancy, choose options,
+generate, review, edit, and save/refine. A first-run checklist and compact
+Sources/CV/Claude readiness indicators explain missing prerequisites. AI
+actions name Claude explicitly and show what is sent; local browsing and
+editing remain available if Claude is offline. Generated text is always marked
+as a draft. Editing a verified letter invalidates its grounding status until
+the edited text is checked again.
+
+The visual layer uses native Streamlit controls and small static CSS: an
+approximately 1180-pixel content width, neutral background, bordered cards,
+high-contrast blue primary actions, visible focus states, system fonts, and a
+responsive single-column form. Dynamic user/model text is rendered through
+native components rather than unsafe HTML.
 
 ## 3. Data flow
 
@@ -220,9 +239,11 @@ return `OK`. Research and CV-import tool permissions are bounded separately.
 
 Gate: fake-client tests cover fresh prompt assembly, language-pair selection,
 strict JSON and fallback parsing, generation/refinement errors, grounding
-outcomes, Windows filenames, collisions, UTF-8, and source hashes. One live
-German and one live English synthetic-vacancy result meet the current source
-controller.
+outcomes, validated research URLs, Windows filenames, collisions, UTF-8,
+source-library hashes, exact-input hashes, and private trace snapshots. One
+live German and one live English synthetic-vacancy result meet the current
+source controller; a separate fictional-source smoke run proves the remote
+pipeline without depending on personal test data.
 
 ### Phase 6 — CV workflow
 
@@ -241,7 +262,13 @@ edits, atomic save, and actionable locked-workbook errors.
 Gate: modules compile; a headless server executes the app without traceback and
 serves HTTP 200; app-level tests exercise initial import, pending widget values,
 generation/refinement state, tracker retry, source edits, CV re-import, and
-friendly health failures.
+friendly health failures. Tests also prove no LLM call occurs without an
+explicit AI-action click, missing prerequisites disable generation, manual
+edits invalidate grounding, tracker retries do not regenerate, and local
+workflows remain available while Claude is offline. Manual acceptance at
+1440-pixel and 390-pixel widths confirms unclipped primary controls,
+keyboard-usable navigation, readable status cues that do not rely on color
+alone, and a clear paste-to-review happy path.
 
 ### Phase 9 — Closing and resilience
 
