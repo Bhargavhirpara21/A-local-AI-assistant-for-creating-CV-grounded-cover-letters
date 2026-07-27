@@ -147,6 +147,32 @@ user-maintained `applied_date`, `status`, and `notes`. Tracker edits in the UI
 are explicit saves. A workbook locked by Excel produces an actionable message
 and never corrupts the existing file.
 
+Application IDs are case-sensitive identifiers of 1–128 control-free
+characters with no surrounding whitespace; they are never silently trimmed or
+case-folded. An existing workbook with duplicate IDs, a renamed/reordered
+schema, formulas in application data, invalid field types, or unreadable/corrupt
+content fails closed and is never overwritten.
+
+`created_at` and `updated_at` are stored as UTC ISO-8601 text and exposed as
+timezone-aware UTC datetimes. `applied_date` is stored as a native Excel date
+and exposed as `date | None`; `used_previous_cv` must be an actual boolean.
+Every application-written text cell is explicitly stored as text even when its
+value begins with `=`, `+`, `-`, or `@`, so model/user text cannot become a
+spreadsheet formula. The tracker does not create workbook hyperlinks; the UI
+owns clickable URL behavior after normal URL validation. Any pre-existing
+hyperlink in an `Applications` data cell is treated as incompatible/corrupt
+workbook data and rejected without rewriting; unrelated sheets remain untouched.
+
+Letter paths are stored as project-relative POSIX-style paths and must resolve
+to an existing Markdown archive inside `letters/`; absolute, missing,
+non-Markdown, symlink-escaping, or otherwise escaping paths are rejected.
+The exact `Applications` schema is owned by the app, while unrelated worksheets
+are preserved. Workbook saves use a same-directory temporary `.xlsx`, flush it,
+reopen and validate it, then publish it with one `os.replace`. A failure before
+or during replacement leaves the previous workbook untouched. Windows
+sharing/permission errors, including WinError 5, 32, and 33, map to guidance to
+close `applications.xlsx` in Excel and retry; logs never contain row content.
+
 ### Streamlit application
 
 `app.py` exposes four workflows through a collapsible sidebar:
@@ -303,7 +329,9 @@ conflicts can be represented as warnings.
 
 Gate: tests prove workbook creation, schema, one-row-per-ID upsert, refinement
 updates, preservation of manual status/date/notes, UTF-8 content, explicit
-edits, atomic save, and actionable locked-workbook errors.
+edits, UTC/date/boolean round-trips, formula-neutral text, confined relative
+letter paths, corruption/duplicate rejection, atomic validated save, and
+actionable locked-workbook errors.
 
 ### Phase 8 — Streamlit UI
 
