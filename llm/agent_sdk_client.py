@@ -4,19 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterable, AsyncIterator
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import (
     AssistantMessage,
+    CanUseTool,
     ClaudeAgentOptions,
     ClaudeSDKError,
     CLIConnectionError,
     CLIJSONDecodeError,
     CLINotFoundError,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ProcessError,
     ResultMessage,
     TextBlock,
+    ToolPermissionContext,
     query,
 )
 
@@ -50,7 +55,10 @@ class AgentSDKClient:
         try:
             cache_path.write_text(system, encoding="utf-8", newline="\n")
         except OSError as error:
-            LOGGER.exception("Could not cache the generation system prompt")
+            LOGGER.warning(
+                "Could not cache the generation system prompt: %s",
+                type(error).__name__,
+            )
             return LLMResult(
                 text="",
                 is_error=True,
@@ -92,16 +100,19 @@ class AgentSDKClient:
                 ),
             )
         ensure_dirs(self._settings)
+        resolved_pdf = pdf_path.resolve()
         options = self._build_options(
             system_prompt=system,
             tools=["Read"],
-            allowed_tools=["Read"],
+            allowed_tools=[],
             model=self._settings.sdk_model,
             max_turns=self._settings.import_max_turns,
-            cwd=self._settings.data_dir,
+            cwd=resolved_pdf.parent,
+            can_use_tool=_build_pdf_read_guard(resolved_pdf),
+            max_buffer_size=self._settings.cv_import_max_buffer_bytes,
         )
         prompt = (
-            f"Read the CV PDF at {pdf_path.resolve()} and convert it following "
+            f"Read the CV PDF at {resolved_pdf} and convert it following "
             "your instructions. Output only the markdown profile."
         )
         return self._run(prompt, options)
@@ -119,8 +130,11 @@ class AgentSDKClient:
         cache_path = self._settings.cache_dir / "last_research_system_prompt.md"
         try:
             cache_path.write_text(system, encoding="utf-8", newline="\n")
-        except OSError:
-            LOGGER.exception("Could not cache the research system prompt")
+        except OSError as error:
+            LOGGER.warning(
+                "Could not cache the research system prompt: %s",
+                type(error).__name__,
+            )
             return LLMResult(
                 text="",
                 is_error=True,
@@ -171,6 +185,8 @@ class AgentSDKClient:
         model: str | None,
         max_turns: int,
         cwd: Path,
+        can_use_tool: CanUseTool | None = None,
+        max_buffer_size: int | None = None,
     ) -> ClaudeAgentOptions:
         cli_path = (
             str(self._settings.cli_path.resolve())
@@ -186,15 +202,22 @@ class AgentSDKClient:
             setting_sources=[],
             skills=[],
             plugins=[],
+            can_use_tool=can_use_tool,
             model=model,
             max_turns=max_turns,
             cwd=str(cwd.resolve()),
             cli_path=cli_path,
+            max_buffer_size=max_buffer_size,
         )
 
     def _run(self, prompt: str, options: ClaudeAgentOptions) -> LLMResult:
         try:
-            return asyncio.run(_collect(prompt, options))
+            sdk_prompt: str | AsyncIterable[dict[str, Any]] = (
+                _single_message_prompt(prompt)
+                if options.can_use_tool is not None
+                else prompt
+            )
+            return asyncio.run(_collect(sdk_prompt, options))
         except CLINotFoundError:
             LOGGER.warning("Claude Code CLI was not found")
             return LLMResult(
@@ -244,8 +267,11 @@ class AgentSDKClient:
                 is_error=True,
                 error_message=self._friendly_failure(str(error)),
             )
-        except OSError:
-            LOGGER.exception("Operating-system failure while running Claude")
+        except OSError as error:
+            LOGGER.warning(
+                "Operating-system failure while running Claude: %s",
+                type(error).__name__,
+            )
             return LLMResult(
                 text="",
                 is_error=True,
@@ -254,8 +280,11 @@ class AgentSDKClient:
                     "Check the configured CLI path and retry."
                 ),
             )
-        except Exception:
-            LOGGER.exception("Unexpected failure at the Claude SDK boundary")
+        except Exception as error:
+            LOGGER.warning(
+                "Unexpected failure at the Claude SDK boundary: %s",
+                type(error).__name__,
+            )
             return LLMResult(
                 text="",
                 is_error=True,
@@ -309,7 +338,62 @@ class AgentSDKClient:
         return self._friendly_failure(message)
 
 
-async def _collect(prompt: str, options: ClaudeAgentOptions) -> LLMResult:
+def _build_pdf_read_guard(pdf_path: Path) -> CanUseTool:
+    """Build a permission callback allowing Read of exactly one PDF identity."""
+
+    resolved_pdf = pdf_path.resolve()
+    allowed_parent = resolved_pdf.parent
+
+    async def guard(
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        del context
+        if tool_name != "Read":
+            return PermissionResultDeny(
+                message="CV import permits only reading the staged PDF."
+            )
+        raw_path = tool_input.get("file_path")
+        if not isinstance(raw_path, str) or not raw_path:
+            return PermissionResultDeny(
+                message="CV import requires the staged PDF path."
+            )
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            candidate = allowed_parent / candidate
+        try:
+            is_allowed = candidate.samefile(resolved_pdf)
+        except (OSError, ValueError):
+            is_allowed = False
+        if not is_allowed:
+            return PermissionResultDeny(
+                message="CV import cannot read files other than the staged PDF."
+            )
+        normalized_input = dict(tool_input)
+        normalized_input["file_path"] = str(resolved_pdf)
+        return PermissionResultAllow(updated_input=normalized_input)
+
+    return guard
+
+
+async def _single_message_prompt(
+    prompt: str,
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield one SDK user message so guarded tool callbacks remain available."""
+
+    yield {
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+        "parent_tool_use_id": None,
+        "session_id": "default",
+    }
+
+
+async def _collect(
+    prompt: str | AsyncIterable[dict[str, Any]],
+    options: ClaudeAgentOptions,
+) -> LLMResult:
     texts: list[str] = []
     final: ResultMessage | None = None
     async for message in query(prompt=prompt, options=options):

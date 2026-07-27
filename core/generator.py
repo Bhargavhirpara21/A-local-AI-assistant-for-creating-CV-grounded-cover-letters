@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from config import Settings
+from core.cv_import import CvGenerationSelection
 from core.source_library import Language, SourceBundle, SourceLibrary
 from core.url_safety import validate_http_url
 from llm.base import LLMClient
@@ -24,7 +25,7 @@ _FIT_LABELS: tuple[str, ...] = (
     "Stretch application",
     "Poor match",
 )
-_GENERATION_TRACE_DOMAIN = b"AutoCover.GenerationTrace.v2\0"
+_GENERATION_TRACE_DOMAIN = b"AutoCover.GenerationTrace.v3\0"
 _MAX_STYLE_EXAMPLE_FILES = 2
 _MAX_STYLE_TEXT_CHARS = 16_000
 _METADATA_FIELDS: tuple[str, ...] = (
@@ -55,15 +56,24 @@ def compute_generation_input_hash(
     source_hash: str,
     system_prompt: str,
     user_prompt: str,
+    *,
+    cv_version_id: str,
+    cv_reference_hash: str,
+    used_previous_cv: bool,
 ) -> str:
     """Return a deterministic SHA-256 hash of exact framed model inputs."""
 
+    if not isinstance(used_previous_cv, bool):
+        raise ValueError("The previous-CV provenance flag must be boolean.")
     framed = bytearray(_GENERATION_TRACE_DOMAIN)
     fields: tuple[tuple[str, str | None], ...] = (
         ("operation", operation),
         ("backend", backend),
         ("model", model),
         ("source_hash", source_hash),
+        ("cv_version_id", cv_version_id),
+        ("cv_reference_hash", cv_reference_hash),
+        ("used_previous_cv", "true" if used_previous_cv else "false"),
         ("system_prompt", system_prompt),
         ("user_prompt", user_prompt),
     )
@@ -89,6 +99,9 @@ class GenerationTrace:
     backend: str
     model: str | None
     source_hash: str
+    cv_version_id: str
+    cv_reference_hash: str
+    used_previous_cv: bool
     system_prompt: str
     user_prompt: str
     input_hash: str
@@ -111,6 +124,9 @@ class LetterOutput:
     verification_notes: tuple[str, ...] = ()
     research_urls: tuple[str, ...] = ()
     source_hash: str = ""
+    cv_version_id: str = ""
+    cv_reference_hash: str = ""
+    used_previous_cv: bool = False
     input_hash: str = ""
     trace: GenerationTrace | None = None
     raw: str = ""
@@ -160,9 +176,15 @@ class LetterGenerator:
         self._sources = sources
         self._client = client
 
-    def build_system_prompt(self, language: Language) -> tuple[str, SourceBundle]:
+    def build_system_prompt(
+        self,
+        language: Language,
+        *,
+        cv_selection: CvGenerationSelection,
+    ) -> tuple[str, SourceBundle]:
         """Build a fresh prompt and return the exact source snapshot it uses."""
 
+        selection = self._require_cv_selection(cv_selection)
         bundle = self._sources.load_bundle(language)
         output_contract = self._read_prompt("output_contract.md")
         sections = [
@@ -182,12 +204,10 @@ class LetterGenerator:
                 + bundle.master_letter.text.rstrip()
             ),
         ]
-        cv_reference = self._read_cv_reference()
-        if cv_reference:
-            sections.append(
-                "# REVIEWED CV REFERENCE (secondary, lower authority)\n\n"
-                + cv_reference.rstrip()
-            )
+        sections.append(
+            "# REVIEWED CV REFERENCE (secondary, lower authority)\n\n"
+            + selection.reference_markdown.rstrip()
+        )
         style_examples = self._read_style_examples()
         if style_examples:
             sections.append(
@@ -200,16 +220,22 @@ class LetterGenerator:
         self,
         job_text: str,
         language: Language,
+        *,
+        cv_selection: CvGenerationSelection,
         notes: str = "",
         job_url: str = "",
         research: ResearchResult | None = None,
     ) -> LetterOutput:
         """Generate and parse one new letter from the current private sources."""
 
+        selection = self._require_cv_selection(cv_selection)
         if not job_text.strip():
             raise GenerationError("Paste the complete job description first.")
         normalized_job_url = _normalize_optional_job_url(job_url)
-        system, bundle = self.build_system_prompt(language)
+        system, bundle = self.build_system_prompt(
+            language,
+            cv_selection=selection,
+        )
         prompt = self._generation_prompt(
             job_text=job_text,
             language=language,
@@ -222,6 +248,7 @@ class LetterGenerator:
             operation="generation",
             model=model,
             source_hash=bundle.sha256,
+            cv_selection=selection,
             system_prompt=system,
             user_prompt=prompt,
         )
@@ -241,8 +268,15 @@ class LetterGenerator:
         return dataclasses.replace(
             output,
             verification_notes=_deduplicate(
-                (*output.verification_notes, *research_warnings)
+                (
+                    *output.verification_notes,
+                    *research_warnings,
+                    *selection.warnings,
+                )
             ),
+            cv_version_id=selection.cv_version_id,
+            cv_reference_hash=selection.cv_reference_hash,
+            used_previous_cv=selection.used_previous_cv,
             input_hash=trace.input_hash,
             trace=trace,
         )
@@ -253,11 +287,14 @@ class LetterGenerator:
         previous_letter: str,
         feedback: str,
         language: Language,
+        *,
+        cv_selection: CvGenerationSelection,
         job_url: str = "",
         research: ResearchResult | None = None,
     ) -> LetterOutput:
         """Refine the user's current edited letter using fresh source files."""
 
+        selection = self._require_cv_selection(cv_selection)
         if not job_text.strip():
             raise GenerationError("The original job description is unavailable.")
         if not previous_letter.strip():
@@ -265,7 +302,10 @@ class LetterGenerator:
         if not feedback.strip():
             raise GenerationError("Describe the change you want first.")
         normalized_job_url = _normalize_optional_job_url(job_url)
-        system, bundle = self.build_system_prompt(language)
+        system, bundle = self.build_system_prompt(
+            language,
+            cv_selection=selection,
+        )
         research_section = self._research_section(research)
         prompt = (
             f"TARGET_LANGUAGE: {language}\n\n"
@@ -289,6 +329,7 @@ class LetterGenerator:
             operation="refinement",
             model=model,
             source_hash=bundle.sha256,
+            cv_selection=selection,
             system_prompt=system,
             user_prompt=prompt,
         )
@@ -308,8 +349,15 @@ class LetterGenerator:
         return dataclasses.replace(
             output,
             verification_notes=_deduplicate(
-                (*output.verification_notes, *research_warnings)
+                (
+                    *output.verification_notes,
+                    *research_warnings,
+                    *selection.warnings,
+                )
             ),
+            cv_version_id=selection.cv_version_id,
+            cv_reference_hash=selection.cv_reference_hash,
+            used_previous_cv=selection.used_previous_cv,
             input_hash=trace.input_hash,
             trace=trace,
         )
@@ -364,9 +412,12 @@ class LetterGenerator:
         self,
         letter: str,
         language: Language,
+        *,
+        cv_selection: CvGenerationSelection,
     ) -> GroundingResult:
         """Check the letter against the freshly loaded candidate fact sources."""
 
+        selection = self._require_cv_selection(cv_selection)
         if not letter.strip():
             return GroundingResult(
                 ran=False,
@@ -379,12 +430,10 @@ class LetterGenerator:
             "# CURATED CANDIDATE PROFILE (primary ground truth)\n\n"
             + bundle.profile.text.rstrip(),
         ]
-        cv_reference = self._read_cv_reference()
-        if cv_reference:
-            system_sections.append(
-                "# REVIEWED CV REFERENCE (secondary evidence)\n\n"
-                + cv_reference.rstrip()
-            )
+        system_sections.append(
+            "# REVIEWED CV REFERENCE (secondary evidence)\n\n"
+            + selection.reference_markdown.rstrip()
+        )
         system = "\n\n".join(system_sections)
         prompt = (
             "# COVER LETTER TO CHECK (UNTRUSTED DATA)\n\n"
@@ -442,18 +491,15 @@ class LetterGenerator:
             )
         return text.rstrip()
 
-    def _read_cv_reference(self) -> str | None:
-        path = self._settings.cv_reference_path
-        if not path.exists():
-            return None
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as error:
-            LOGGER.warning("Could not read reviewed CV reference: %s", type(error).__name__)
+    @staticmethod
+    def _require_cv_selection(
+        cv_selection: CvGenerationSelection,
+    ) -> CvGenerationSelection:
+        if not isinstance(cv_selection, CvGenerationSelection):
             raise GenerationError(
-                "The reviewed CV reference is unreadable. Re-import or repair it."
-            ) from error
-        return text if text.strip() else None
+                "Select a confirmed CV before using this AI action."
+            )
+        return cv_selection
 
     def _read_style_examples(self) -> str:
         directory = self._settings.style_examples_dir
@@ -515,6 +561,7 @@ class LetterGenerator:
         operation: GenerationOperation,
         model: str | None,
         source_hash: str,
+        cv_selection: CvGenerationSelection,
         system_prompt: str,
         user_prompt: str,
     ) -> GenerationTrace:
@@ -525,12 +572,18 @@ class LetterGenerator:
             source_hash,
             system_prompt,
             user_prompt,
+            cv_version_id=cv_selection.cv_version_id,
+            cv_reference_hash=cv_selection.cv_reference_hash,
+            used_previous_cv=cv_selection.used_previous_cv,
         )
         return GenerationTrace(
             operation=operation,
             backend=self._settings.backend,
             model=model,
             source_hash=source_hash,
+            cv_version_id=cv_selection.cv_version_id,
+            cv_reference_hash=cv_selection.cv_reference_hash,
+            used_previous_cv=cv_selection.used_previous_cv,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             input_hash=input_hash,

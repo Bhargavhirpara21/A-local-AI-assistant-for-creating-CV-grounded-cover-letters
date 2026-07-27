@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import tempfile
 import unittest
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from claude_agent_sdk import (
@@ -16,12 +18,15 @@ from claude_agent_sdk import (
     CLIConnectionError,
     CLIJSONDecodeError,
     CLINotFoundError,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ProcessError,
     ResultMessage,
     TextBlock,
+    ToolPermissionContext,
 )
 
-from config import build_settings
+from config import Settings, build_settings
 from llm.agent_sdk_client import AgentSDKClient, _collect
 from llm.base import LLMResult
 
@@ -54,7 +59,7 @@ def _query_with(
 
     async def fake_query(
         *,
-        prompt: str,
+        prompt: str | AsyncIterable[dict[str, Any]],
         options: ClaudeAgentOptions,
     ) -> AsyncIterator[AssistantMessage | ResultMessage]:
         del prompt, options
@@ -129,6 +134,11 @@ class CollectorTests(unittest.TestCase):
 class AgentSDKClientTests(unittest.TestCase):
     """Verify exact SDK permissions, prompt caching, health, and exceptions."""
 
+    _temporary_directory: tempfile.TemporaryDirectory[str]
+    root: Path
+    settings: Settings
+    client: AgentSDKClient
+
     def setUp(self) -> None:
         """Create isolated settings and prompt assets for each test."""
 
@@ -175,10 +185,24 @@ class AgentSDKClientTests(unittest.TestCase):
             },
         )
 
-    def test_cv_import_has_only_read_permission(self) -> None:
-        """CV import should permit Read and no other SDK tool."""
+    def test_prompt_cache_failure_logs_omit_private_exception_details(self) -> None:
+        """A cache error must not log a private path or prompt-derived detail."""
 
-        pdf_path = self.settings.data_dir / "cv.pdf"
+        secret = r"SECRET-PROMPT C:\private\cache\prompt.md"
+        with self.assertLogs(
+            "llm.agent_sdk_client",
+            level=logging.WARNING,
+        ) as captured:
+            with patch.object(Path, "write_text", side_effect=OSError(secret)):
+                result = self.client.generate("private system", "private prompt")
+
+        self.assertTrue(result.is_error)
+        self.assertNotIn(secret, "\n".join(captured.output))
+
+    def test_cv_import_has_exact_path_guard_and_isolated_options(self) -> None:
+        """CV import should expose Read only through an exact-file guard."""
+
+        pdf_path = self.settings.cv_staging_dir / "attempt-1" / "cv.pdf"
         pdf_path.parent.mkdir(parents=True)
         pdf_path.write_bytes(b"%PDF-synthetic")
 
@@ -192,12 +216,137 @@ class AgentSDKClientTests(unittest.TestCase):
         prompt, options = run.call_args.args
         self.assertIn(str(pdf_path.resolve()), prompt)
         self.assertEqual(options.tools, ["Read"])
-        self.assertEqual(options.allowed_tools, ["Read"])
+        self.assertEqual(options.allowed_tools, [])
+        self.assertIsNotNone(options.can_use_tool)
         self.assertEqual(options.mcp_servers, {})
         self.assertTrue(options.strict_mcp_config)
         self.assertEqual(options.setting_sources, [])
         self.assertEqual(options.skills, [])
-        self.assertEqual(options.cwd, str(self.settings.data_dir))
+        self.assertEqual(options.plugins, [])
+        self.assertEqual(options.cwd, str(pdf_path.parent.resolve()))
+        self.assertEqual(
+            options.max_buffer_size,
+            self.settings.cv_import_max_buffer_bytes,
+        )
+
+    def test_cv_read_guard_allows_only_the_staged_pdf_identity(self) -> None:
+        """The permission callback should deny siblings, traversal, and tools."""
+
+        pdf_path = self.settings.cv_staging_dir / "attempt-1" / "cv.pdf"
+        pdf_path.parent.mkdir(parents=True)
+        pdf_path.write_bytes(b"%PDF-synthetic")
+        sibling = self.settings.source_library_dir / "private.md"
+        sibling.parent.mkdir(parents=True)
+        sibling.write_text("private", encoding="utf-8")
+
+        with patch.object(
+            self.client,
+            "_run",
+            return_value=LLMResult(text="# Profile"),
+        ) as run:
+            self.client.import_cv(pdf_path)
+
+        options = run.call_args.args[1]
+        guard = options.can_use_tool
+        self.assertIsNotNone(guard)
+        assert guard is not None
+        context = ToolPermissionContext()
+
+        exact = asyncio.run(
+            guard("Read", {"file_path": str(pdf_path.resolve())}, context)
+        )
+        relative = asyncio.run(
+            guard("Read", {"file_path": "cv.pdf"}, context)
+        )
+        sibling_read = asyncio.run(
+            guard("Read", {"file_path": str(sibling.resolve())}, context)
+        )
+        traversal_read = asyncio.run(
+            guard(
+                "Read",
+                {
+                    "file_path": str(
+                        Path("..")
+                        / ".."
+                        / ".."
+                        / "source_library"
+                        / "private.md"
+                    )
+                },
+                context,
+            )
+        )
+        other_tool = asyncio.run(
+            guard("Bash", {"command": "type cv.pdf"}, context)
+        )
+        invalid_input = asyncio.run(
+            guard("Read", {"file_path": 123}, context)
+        )
+
+        self.assertIsInstance(exact, PermissionResultAllow)
+        self.assertIsInstance(relative, PermissionResultAllow)
+        for denied in (
+            sibling_read,
+            traversal_read,
+            other_tool,
+            invalid_input,
+        ):
+            self.assertIsInstance(denied, PermissionResultDeny)
+
+    def test_run_uses_one_message_stream_only_for_guarded_cv_import(self) -> None:
+        """A guarded request should reach the SDK as one streamed user message."""
+
+        pdf_path = self.settings.cv_staging_dir / "attempt-1" / "cv.pdf"
+        pdf_path.parent.mkdir(parents=True)
+        pdf_path.write_bytes(b"%PDF-synthetic")
+        captured_prompts: list[str | AsyncIterable[dict[str, Any]]] = []
+
+        async def fake_collect(
+            prompt: str | AsyncIterable[dict[str, Any]],
+            options: ClaudeAgentOptions,
+        ) -> LLMResult:
+            del options
+            captured_prompts.append(prompt)
+            return LLMResult(text="# Profile")
+
+        with patch("llm.agent_sdk_client._collect", side_effect=fake_collect):
+            guarded = self.client.import_cv(pdf_path)
+
+        self.assertFalse(guarded.is_error)
+        self.assertEqual(len(captured_prompts), 1)
+        streamed_prompt = captured_prompts[0]
+        self.assertIsInstance(streamed_prompt, AsyncIterable)
+        assert isinstance(streamed_prompt, AsyncIterable)
+
+        async def consume_messages() -> list[dict[str, Any]]:
+            return [message async for message in streamed_prompt]
+
+        messages = asyncio.run(consume_messages())
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["type"], "user")
+        self.assertEqual(messages[0]["message"]["role"], "user")
+        self.assertIn(str(pdf_path.resolve()), messages[0]["message"]["content"])
+        self.assertIsNone(messages[0]["parent_tool_use_id"])
+        self.assertEqual(messages[0]["session_id"], "default")
+
+    def test_run_keeps_tool_free_requests_as_plain_strings(self) -> None:
+        """Generation should retain the existing one-shot string request shape."""
+
+        captured_prompts: list[str | AsyncIterable[dict[str, Any]]] = []
+
+        async def fake_collect(
+            prompt: str | AsyncIterable[dict[str, Any]],
+            options: ClaudeAgentOptions,
+        ) -> LLMResult:
+            del options
+            captured_prompts.append(prompt)
+            return LLMResult(text="OK")
+
+        with patch("llm.agent_sdk_client._collect", side_effect=fake_collect):
+            result = self.client.generate("system", "plain prompt")
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(captured_prompts, ["plain prompt"])
 
     def test_research_has_only_bounded_web_tools(self) -> None:
         """Research should expose WebSearch/WebFetch without local-file tools."""
@@ -270,6 +419,35 @@ class AgentSDKClientTests(unittest.TestCase):
                     value = self.client._run("prompt", ClaudeAgentOptions())
                 self.assertTrue(value.is_error)
                 self.assertIn(expected_fragment, value.error_message or "")
+
+    def test_unexpected_sdk_logs_never_expose_private_exception_text(self) -> None:
+        """Generic boundary diagnostics must omit paths and provider content."""
+
+        secret = r"SECRET-CV-CONTENT C:\private\staging\cv.pdf"
+        for error in (OSError(secret), RuntimeError(secret)):
+            with self.subTest(error=type(error).__name__):
+
+                def raise_from_run(coroutine: object) -> LLMResult:
+                    close = getattr(coroutine, "close", None)
+                    if callable(close):
+                        close()
+                    raise error
+
+                with self.assertLogs(
+                    "llm.agent_sdk_client",
+                    level=logging.WARNING,
+                ) as captured:
+                    with patch(
+                        "llm.agent_sdk_client.asyncio.run",
+                        side_effect=raise_from_run,
+                    ):
+                        value = self.client._run(
+                            "private prompt",
+                            ClaudeAgentOptions(),
+                        )
+
+                self.assertTrue(value.is_error)
+                self.assertNotIn(secret, "\n".join(captured.output))
 
     def test_missing_cli_guidance_rejects_batch_shims(self) -> None:
         """Windows guidance should use the bundled/native executable path."""

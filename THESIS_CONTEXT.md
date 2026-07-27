@@ -83,6 +83,10 @@ merge, or choose conflicting facts.
 - Personal data and application history never enter Git.
 - Normal letter generation sends the reviewed Markdown reference, not the raw
   CV PDF, and never sends the Excel workbook or unrelated application history.
+- Starting a new CV import blocks silent use of an older CV. If the new import
+  is pending or fails, the previous confirmed CV may be used only after the
+  user explicitly approves that fallback for the current application. The
+  selected CV version and fallback decision are recorded with the result.
 - The selected source-library version and the exact generation inputs are
   identified by separate content hashes in archives and tracker records.
   Exact prompts are retained only in a private, Git-ignored trace snapshot so

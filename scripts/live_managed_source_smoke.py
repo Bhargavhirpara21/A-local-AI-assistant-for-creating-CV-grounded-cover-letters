@@ -7,6 +7,7 @@ import logging
 from typing import cast
 
 from config import build_settings
+from core.cv_import import CvGenerationSelection, CvImportWorkflow
 from core.generator import LetterGenerator, LetterOutput
 from core.language import detect_language
 from core.source_library import Language, SourceLibrary
@@ -37,6 +38,8 @@ def main(
             "The managed source library is incomplete; import it before testing."
         )
     client = get_client(settings)
+    cv_workflow = CvImportWorkflow(settings, client)
+    cv_selection = cv_workflow.select_for_generation()
     generator = LetterGenerator(settings, sources, client)
     cases = tuple(
         case
@@ -45,14 +48,22 @@ def main(
     )
     for case in cases:
         source_hash_before = sources.load_bundle(case.language).sha256
-        output = generator.generate_letter(case.job_text, case.language)
-        _validate_managed_output(output, case, sources)
+        output = generator.generate_letter(
+            case.job_text,
+            case.language,
+            cv_selection=cv_selection,
+        )
+        _validate_managed_output(output, case, sources, cv_selection)
         source_hash_after = sources.load_bundle(case.language).sha256
         if source_hash_after != source_hash_before:
             raise RuntimeError(
                 f"{case.language} managed sources changed during generation."
             )
-        grounding = generator.check_grounding(output.letter, case.language)
+        grounding = generator.check_grounding(
+            output.letter,
+            case.language,
+            cv_selection=cv_selection,
+        )
         if not grounding.ran:
             raise RuntimeError(
                 f"{case.language} managed-source grounding could not execute."
@@ -78,6 +89,7 @@ def _validate_managed_output(
     output: LetterOutput,
     case: SmokeCase,
     sources: SourceLibrary,
+    cv_selection: CvGenerationSelection,
 ) -> None:
     if output.language != case.language:
         raise RuntimeError(f"{case.language} output used the wrong language.")
@@ -96,6 +108,26 @@ def _validate_managed_output(
         )
     if output.trace.input_hash != output.input_hash:
         raise RuntimeError(f"{case.language} output has the wrong input hash.")
+    if output.cv_version_id != cv_selection.cv_version_id:
+        raise RuntimeError(f"{case.language} output has the wrong CV version.")
+    if output.cv_reference_hash != cv_selection.cv_reference_hash:
+        raise RuntimeError(
+            f"{case.language} output has the wrong CV reference hash."
+        )
+    if output.used_previous_cv != cv_selection.used_previous_cv:
+        raise RuntimeError(
+            f"{case.language} output has the wrong previous-CV decision."
+        )
+    if output.trace.cv_version_id != output.cv_version_id:
+        raise RuntimeError(f"{case.language} trace has the wrong CV version.")
+    if output.trace.cv_reference_hash != output.cv_reference_hash:
+        raise RuntimeError(
+            f"{case.language} trace has the wrong CV reference hash."
+        )
+    if output.trace.used_previous_cv != output.used_previous_cv:
+        raise RuntimeError(
+            f"{case.language} trace has the wrong previous-CV decision."
+        )
     if detect_language(output.letter) != case.language:
         raise RuntimeError(f"{case.language} output failed language detection.")
     parser_markers = (

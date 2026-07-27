@@ -18,9 +18,12 @@ class Settings:
     uploads_dir: Path
     cache_dir: Path
     letters_dir: Path
-    cv_pdf_path: Path
-    cv_reference_path: Path
-    cv_metadata_path: Path
+    cv_dir: Path
+    cv_versions_dir: Path
+    cv_staging_dir: Path
+    cv_active_path: Path
+    cv_pending_path: Path
+    cv_pending_recovery_path: Path
     applications_path: Path
     system_prompt_cache_path: Path
     backend: str = "agent_sdk"
@@ -38,6 +41,8 @@ class Settings:
     max_source_file_bytes: int = 1024 * 1024
     max_source_total_bytes: int = 5 * 1024 * 1024
     max_source_compression_ratio: int = 100
+    max_cv_pdf_bytes: int = 25 * 1024 * 1024
+    cv_import_max_buffer_bytes: int = 64 * 1024 * 1024
     application_statuses: tuple[str, ...] = (
         "Draft",
         "Applied",
@@ -56,6 +61,7 @@ def build_settings(project_root: Path | None = None) -> Settings:
     data_dir = root / "data"
     uploads_dir = data_dir / "uploads"
     cache_dir = data_dir / "cache"
+    cv_dir = data_dir / "cv"
     return Settings(
         project_root=root,
         prompts_dir=prompts_dir,
@@ -65,9 +71,12 @@ def build_settings(project_root: Path | None = None) -> Settings:
         uploads_dir=uploads_dir,
         cache_dir=cache_dir,
         letters_dir=root / "letters",
-        cv_pdf_path=uploads_dir / "cv.pdf",
-        cv_reference_path=data_dir / "cv_reference.md",
-        cv_metadata_path=data_dir / "cv_reference.json",
+        cv_dir=cv_dir,
+        cv_versions_dir=cv_dir / "versions",
+        cv_staging_dir=cv_dir / "staging",
+        cv_active_path=cv_dir / "active.json",
+        cv_pending_path=cv_dir / "pending.json",
+        cv_pending_recovery_path=cv_dir / "pending.recovery.json",
         applications_path=data_dir / "applications.xlsx",
         system_prompt_cache_path=cache_dir / "last_system_prompt.md",
     )
@@ -83,6 +92,9 @@ def ensure_dirs(settings: Settings) -> None:
         settings.source_library_dir,
         settings.uploads_dir,
         settings.cache_dir,
+        settings.cv_dir,
+        settings.cv_versions_dir,
+        settings.cv_staging_dir,
         settings.letters_dir,
     )
     for directory in directories:

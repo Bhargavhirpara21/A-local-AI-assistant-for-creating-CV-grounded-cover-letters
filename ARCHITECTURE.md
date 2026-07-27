@@ -38,16 +38,38 @@ effect on the next call.
 
 ### CV reference
 
-`core/cv_import.py` stores the uploaded PDF under `data/uploads/cv.pdf`, asks
-the backend to extract a reviewable Markdown reference, and saves it under
-`data/cv_reference.md` only after user review. It also records the imported PDF
-hash. If the PDF bytes change, the UI marks the reference as stale and requires
-re-import before relying on the changed CV.
+`core/cv_import.py` stores each confirmed PDF, reviewed Markdown reference, and
+metadata as one immutable private bundle under `data/cv/versions/<version-id>/`.
+`data/cv/active.json` selects a complete bundle through one atomic pointer
+replacement. New uploads are staged under `data/cv/staging/`; a persistent
+pending-state record distinguishes extraction/review in progress, failure, and
+local validation rejection. An explicit discard removes that pending marker
+and its safely identified staging directory. A small
+`data/cv/pending.recovery.json` sidecar binds the attempt identifier and exact
+previous version independently of the richer pending record, allowing safe
+fallback and exact cleanup even if `pending.json` becomes unreadable. The
+pending state snapshots the exact previous confirmed version, so even a
+file-lock failure after pointer publication can never relabel the newly
+reviewed CV as the old fallback. Confirmation validates the staged PDF and
+reviewed reference, publishes a complete version, and only then switches the
+active pointer.
 
 The matching curated candidate profile remains the primary source. The CV
 reference is labelled as lower-authority context; material conflicts become
 verification warnings. A cancelled or failed re-import leaves the previously
-confirmed PDF and reference unchanged; confirmation replaces them atomically.
+confirmed bundle unchanged but blocks silent fallback to it. Generation stays
+blocked until the user retries, discards the new attempt, or explicitly chooses
+**Use previous CV for this application**. That approval is scoped to one
+application/generation workflow and is requested again for later applications
+while the new-CV problem remains. If no previous confirmed version exists,
+fallback is unavailable. Local validation rejection and corrupt pending
+storage follow the same fail-closed rule; corrupt state can be explicitly
+discarded without following an unvalidated path.
+
+Every generation receives an explicit CV selection containing the version ID,
+reference hash, and whether previous-CV fallback was approved. A stale,
+corrupted, or unconfirmed reference is never placed in a prompt. The archived
+letter and tracker row record the selected version and fallback decision.
 
 ### Language and prompt assembly
 
@@ -88,9 +110,10 @@ Front matter stores parsed metadata, application ID, timestamps, refinement
 state, source-library hash, exact-input hash, and research URLs. The full job
 description is retained in a collapsed details block. A collision-matched
 `.trace.json` file stores the exact system and user prompts, operation, backend,
-and model used. Both files are private and Git-ignored. The snapshot makes a
-request auditable and replayable, not deterministically reproducible. Paths are
-legal on Windows and collision-safe.
+model, selected CV version/reference hash, and previous-CV fallback decision.
+Both files are private and Git-ignored. The snapshot makes a request auditable
+and replayable, not deterministically reproducible. Paths are legal on Windows
+and collision-safe.
 
 ### Excel tracker
 
@@ -113,7 +136,10 @@ legal on Windows and collision-safe.
 14. `letter_path`
 15. `source_hash`
 16. `input_hash`
-17. `notes`
+17. `cv_version_id`
+18. `cv_reference_hash`
+19. `used_previous_cv`
+20. `notes`
 
 The initial successful generation creates one row with status `Draft`.
 Refinement updates the same row and letter path. Automated updates preserve
@@ -135,6 +161,12 @@ and never corrupts the existing file.
 
 Durable rerun state is kept in `st.session_state`. Dependencies are constructed
 once per session and passed to workflow functions.
+
+The UI also keeps a session-level CV safety block if the filesystem is too
+unavailable to create even the recovery marker. In that exceptional case it
+must not generate or offer old-CV fallback in the current session; it directs
+the user to restore data-directory access and retry or restart. App-level tests
+must prove this fail-closed behavior.
 
 The primary flow is one vertical sequence: paste vacancy, choose options,
 generate, review, edit, and save/refine. A first-run checklist and compact
@@ -164,10 +196,12 @@ job text / URL ───────┘                                      │
                        Markdown archive              Excel upsert
 ```
 
-Generation succeeds only when the five-file library is complete. Archival and
-tracker upsert happen only after a successful parsed generation. If tracker
-writing fails, the already-generated letter remains visible and archivable,
-and the UI provides a retry without another model call.
+Generation succeeds only when the five-file library is complete and the CV
+workflow supplies an eligible explicit selection. A pending/failed new CV
+cannot silently resolve to the older active bundle. Archival and tracker upsert
+happen only after a successful parsed generation. If tracker writing fails,
+the already-generated letter remains visible and archivable, and the UI
+provides a retry without another model call.
 
 ## 4. Security and privacy
 
@@ -181,7 +215,13 @@ and the UI provides a retry without another model call.
 - Job descriptions and researched pages are untrusted data. Prompts explicitly
   reject instructions embedded in them.
 - Generation has no tools and cannot read arbitrary local files.
-- CV import receives only the uploaded CV path and only the `Read` tool.
+- CV import stages one PDF in an isolated attempt directory. Its SDK permission
+  callback approves `Read` only when the requested path resolves to that exact
+  staged PDF (`Path.samefile`); all other paths and tools are denied. The call
+  does not place `Read` in `allowed_tools`, because that would bypass the
+  per-path decision. The SDK subprocess buffer is raised only for CV import and
+  remains bounded at 64 MiB so a permitted PDF-render response can exceed the
+  SDK's 1 MiB default without making other model calls broadly buffered.
 - Normal generation sends only the selected language pair, controller, reviewed
   CV reference, current posting, and explicit notes. It never sends the raw
   PDF, workbook, prior application rows, other-language pair, or unrelated
@@ -247,9 +287,17 @@ pipeline without depending on personal test data.
 
 ### Phase 6 — CV workflow
 
-Gate: PDF bytes and hashes round-trip; blank/reference behavior passes; stale
-PDF detection works; the supplied CV imports to reviewable Markdown without
-modifying curated profiles; conflicts can be represented as warnings.
+Gate: tests define and prove PDF validation, exact byte/hash round-trip,
+version-bundle publication, one-pointer atomic activation, pending/failure
+state, review-before-confirmation, stale/corrupt detection, and preservation of
+the previous active bundle on every failed path. Generation is blocked by
+default after an invalid upload, staging/extraction problem, or corrupt pending
+state; previous-CV use requires explicit
+per-application consent, is unavailable without a confirmed previous version,
+and is recorded in output/archive provenance. SDK tests prove the import tool
+can read only the exact staged PDF and denies every other file/tool. The
+supplied CV imports to reviewable Markdown without modifying curated profiles;
+conflicts can be represented as warnings.
 
 ### Phase 7 — Excel tracker
 
@@ -265,7 +313,10 @@ generation/refinement state, tracker retry, source edits, CV re-import, and
 friendly health failures. Tests also prove no LLM call occurs without an
 explicit AI-action click, missing prerequisites disable generation, manual
 edits invalidate grounding, tracker retries do not regenerate, and local
-workflows remain available while Claude is offline. Manual acceptance at
+workflows remain available while Claude is offline. Tests also prove that a CV
+selection is scoped to one application workflow and invalidated as soon as
+another upload starts, and that an unpersistable CV-update attempt sets a
+session safety block instead of reusing a cached selection. Manual acceptance at
 1440-pixel and 390-pixel widths confirms unclipped primary controls,
 keyboard-usable navigation, readable status cues that do not rely on color
 alone, and a clear paste-to-review happy path.

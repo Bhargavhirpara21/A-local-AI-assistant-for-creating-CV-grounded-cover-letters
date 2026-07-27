@@ -289,7 +289,7 @@ def _validated_trace_snapshot(
     output: LetterOutput,
     *,
     refined: bool,
-) -> dict[str, str | None]:
+) -> dict[str, str | bool | None]:
     from core.generator import compute_generation_input_hash
 
     source_hash = _validated_sha256(
@@ -335,6 +335,39 @@ def _validated_trace_snapshot(
         raise ArchiveError(
             "The output source hash does not match its generation trace."
         )
+    output_cv_version_id = _required_archive_text(
+        getattr(output, "cv_version_id", None),
+        label="CV version ID",
+    )
+    trace_cv_version_id = _required_trace_text(trace, "cv_version_id")
+    if trace_cv_version_id != output_cv_version_id:
+        raise ArchiveError(
+            "The output CV version ID does not match its generation trace."
+        )
+    output_cv_reference_hash = _validated_sha256(
+        getattr(output, "cv_reference_hash", None),
+        label="CV reference hash",
+    )
+    trace_cv_reference_hash = _validated_sha256(
+        getattr(trace, "cv_reference_hash", None),
+        label="trace CV reference hash",
+    )
+    if trace_cv_reference_hash != output_cv_reference_hash:
+        raise ArchiveError(
+            "The output CV reference hash does not match its generation trace."
+        )
+    output_used_previous_cv = _validated_bool(
+        getattr(output, "used_previous_cv", None),
+        label="output previous-CV flag",
+    )
+    trace_used_previous_cv = _validated_bool(
+        getattr(trace, "used_previous_cv", None),
+        label="trace previous-CV flag",
+    )
+    if trace_used_previous_cv != output_used_previous_cv:
+        raise ArchiveError(
+            "The output previous-CV flag does not match its generation trace."
+        )
     calculated_hash = compute_generation_input_hash(
         operation,
         backend,
@@ -342,6 +375,9 @@ def _validated_trace_snapshot(
         trace_source_hash,
         system_prompt,
         user_prompt,
+        cv_version_id=trace_cv_version_id,
+        cv_reference_hash=trace_cv_reference_hash,
+        used_previous_cv=trace_used_previous_cv,
     )
     if trace_input_hash != calculated_hash:
         raise ArchiveError(
@@ -355,6 +391,9 @@ def _validated_trace_snapshot(
         "system_prompt": system_prompt,
         "user_prompt": user_prompt,
         "source_hash": source_hash,
+        "cv_version_id": output_cv_version_id,
+        "cv_reference_hash": output_cv_reference_hash,
+        "used_previous_cv": output_used_previous_cv,
         "input_hash": output_input_hash,
     }
 
@@ -366,6 +405,18 @@ def _required_trace_text(trace: object, field_name: str) -> str:
         raise ArchiveError(
             f"The generation trace {readable_name} must be non-empty text."
         )
+    return value
+
+
+def _required_archive_text(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ArchiveError(f"The archive {label} must be non-empty text.")
+    return value
+
+
+def _validated_bool(value: object, *, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ArchiveError(f"The archive {label} must be boolean.")
     return value
 
 
@@ -418,6 +469,9 @@ def _render_archive(
         f"refined: {'true' if refined else 'false'}",
         f"source_hash: {_yaml_scalar(output.source_hash)}",
         f"input_hash: {_yaml_scalar(output.input_hash)}",
+        f"cv_version_id: {_yaml_scalar(output.cv_version_id)}",
+        f"cv_reference_hash: {_yaml_scalar(output.cv_reference_hash)}",
+        f"used_previous_cv: {'true' if output.used_previous_cv else 'false'}",
     ]
     _append_yaml_sequence(
         frontmatter,

@@ -14,6 +14,7 @@ from scripts.live_generation_smoke import (
     _MAX_SMOKE_LETTER_WORDS,
     _MIN_SMOKE_LETTER_WORDS,
     _isolated_settings,
+    _synthetic_cv_selection,
     _synthetic_source_archive,
 )
 
@@ -45,9 +46,12 @@ class LiveGenerationSmokeIsolationTests(unittest.TestCase):
             settings.uploads_dir,
             settings.cache_dir,
             settings.letters_dir,
-            settings.cv_pdf_path,
-            settings.cv_reference_path,
-            settings.cv_metadata_path,
+            settings.cv_dir,
+            settings.cv_versions_dir,
+            settings.cv_staging_dir,
+            settings.cv_active_path,
+            settings.cv_pending_path,
+            settings.cv_pending_recovery_path,
             settings.applications_path,
             settings.system_prompt_cache_path,
         )
@@ -79,6 +83,17 @@ class LiveGenerationSmokeIsolationTests(unittest.TestCase):
         self.assertIn("Avery Morgan", bodies[1])
         self.assertIn("Avery Morgan", bodies[2])
         self.assertTrue(all(body.strip() for body in bodies))
+
+    def test_cv_selection_is_complete_and_explicitly_fictional(self) -> None:
+        """The public smoke must use a valid fake CV rather than no or real CV."""
+
+        selection = _synthetic_cv_selection()
+
+        self.assertEqual(selection.cv_version_id, "fictional-smoke-cv-v1")
+        self.assertIn("fictional", selection.reference_markdown.casefold())
+        self.assertIn("Avery Morgan", selection.reference_markdown)
+        self.assertFalse(selection.used_previous_cv)
+        self.assertEqual(selection.warnings, ())
 
 
 if __name__ == "__main__":

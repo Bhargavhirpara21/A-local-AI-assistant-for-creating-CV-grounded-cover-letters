@@ -29,6 +29,9 @@ class _GenerationTraceStub:
     backend: str
     model: str | None
     source_hash: str
+    cv_version_id: str
+    cv_reference_hash: str
+    used_previous_cv: bool
     system_prompt: str
     user_prompt: str
     input_hash: str
@@ -51,6 +54,9 @@ class _LetterOutputStub:
     verification_notes: tuple[str, ...]
     research_urls: tuple[str, ...]
     source_hash: str
+    cv_version_id: str
+    cv_reference_hash: str
+    used_previous_cv: bool
     input_hash: str
     trace: _GenerationTraceStub | None
 
@@ -59,12 +65,18 @@ def _generation_input_hash(trace: _GenerationTraceStub) -> str:
     """Reproduce the versioned framed hash contract independently in tests."""
 
     digest = hashlib.sha256()
-    digest.update(b"AutoCover.GenerationTrace.v2\0")
+    digest.update(b"AutoCover.GenerationTrace.v3\0")
     fields: tuple[tuple[str, str | None], ...] = (
         ("operation", trace.operation),
         ("backend", trace.backend),
         ("model", trace.model),
         ("source_hash", trace.source_hash),
+        ("cv_version_id", trace.cv_version_id),
+        ("cv_reference_hash", trace.cv_reference_hash),
+        (
+            "used_previous_cv",
+            "true" if trace.used_previous_cv else "false",
+        ),
         ("system_prompt", trace.system_prompt),
         ("user_prompt", trace.user_prompt),
     )
@@ -102,6 +114,9 @@ class LetterArchiveTests(unittest.TestCase):
             backend="agent_sdk",
             model=None,
             source_hash="a" * 64,
+            cv_version_id="cv-fictional-v1",
+            cv_reference_hash="b" * 64,
+            used_previous_cv=False,
             system_prompt="# Fictional system prompt\n\nUse only supplied facts.\r\n",
             user_prompt=(
                 "# FICTIONAL JOB DESCRIPTION\r\n"
@@ -139,6 +154,9 @@ class LetterArchiveTests(unittest.TestCase):
                 "https://northstar.example/about",
             ),
             source_hash="a" * 64,
+            cv_version_id=self.trace.cv_version_id,
+            cv_reference_hash=self.trace.cv_reference_hash,
+            used_previous_cv=self.trace.used_previous_cv,
             input_hash=self.trace.input_hash,
             trace=self.trace,
         )
@@ -196,6 +214,9 @@ class LetterArchiveTests(unittest.TestCase):
         self.assertIn('  - "No certification was claimed."\n', text)
         self.assertIn(f'source_hash: "{"a" * 64}"\n', text)
         self.assertIn(f'input_hash: "{self.output.input_hash}"\n', text)
+        self.assertIn('cv_version_id: "cv-fictional-v1"\n', text)
+        self.assertIn(f'cv_reference_hash: "{"b" * 64}"\n', text)
+        self.assertIn("used_previous_cv: false\n", text)
         self.assertEqual(
             text.count('  - "https://northstar.example/about"\n'),
             1,
@@ -224,10 +245,45 @@ class LetterArchiveTests(unittest.TestCase):
                 "system_prompt": self.trace.system_prompt,
                 "user_prompt": self.trace.user_prompt,
                 "source_hash": self.output.source_hash,
+                "cv_version_id": self.output.cv_version_id,
+                "cv_reference_hash": self.output.cv_reference_hash,
+                "used_previous_cv": self.output.used_previous_cv,
                 "input_hash": self.output.input_hash,
             },
         )
         self.assertTrue(trace_path.read_bytes().endswith(b"\n"))
+
+    def test_previous_cv_consent_is_hash_bound_and_archived_as_true(self) -> None:
+        """Explicit previous-CV use must survive in both private artifacts."""
+
+        incomplete_trace = replace(
+            self.trace,
+            used_previous_cv=True,
+            input_hash="",
+        )
+        trace = replace(
+            incomplete_trace,
+            input_hash=_generation_input_hash(incomplete_trace),
+        )
+        output = replace(
+            self.output,
+            used_previous_cv=True,
+            input_hash=trace.input_hash,
+            trace=trace,
+        )
+
+        path = LetterArchive(self.settings, clock=lambda: self.now).save_letter(
+            output,
+            "Complete fictional posting",
+            "application-previous-cv",
+        )
+
+        text = path.read_text(encoding="utf-8")
+        trace_data = json.loads(
+            path.with_suffix(".trace.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("used_previous_cv: true\n", text)
+        self.assertIs(trace_data["used_previous_cv"], True)
 
     def test_frontmatter_values_cannot_inject_new_yaml_keys(self) -> None:
         """Model-derived strings should remain safely quoted YAML scalars."""
@@ -458,6 +514,70 @@ class LetterArchiveTests(unittest.TestCase):
             (
                 "well-formed mismatched source hash",
                 self._output_with_trace_source_hash("b" * 64),
+                False,
+            ),
+            (
+                "blank output CV version",
+                replace(self.output, cv_version_id=""),
+                False,
+            ),
+            (
+                "blank trace CV version",
+                replace(
+                    self.output,
+                    trace=replace(self.trace, cv_version_id=""),
+                ),
+                False,
+            ),
+            (
+                "mismatched CV version",
+                replace(
+                    self.output,
+                    trace=replace(self.trace, cv_version_id="cv-other-v2"),
+                ),
+                False,
+            ),
+            (
+                "malformed output CV reference hash",
+                replace(self.output, cv_reference_hash="short"),
+                False,
+            ),
+            (
+                "mismatched CV reference hash",
+                replace(
+                    self.output,
+                    trace=replace(self.trace, cv_reference_hash="c" * 64),
+                ),
+                False,
+            ),
+            (
+                "non-boolean output previous-CV flag",
+                replace(self.output, used_previous_cv="false"),
+                False,
+            ),
+            (
+                "non-boolean trace previous-CV flag",
+                replace(
+                    self.output,
+                    trace=replace(self.trace, used_previous_cv="false"),
+                ),
+                False,
+            ),
+            (
+                "mismatched previous-CV flag",
+                replace(
+                    self.output,
+                    trace=replace(self.trace, used_previous_cv=True),
+                ),
+                False,
+            ),
+            (
+                "previous-CV flag tampered without rehash",
+                replace(
+                    self.output,
+                    used_previous_cv=True,
+                    trace=replace(self.trace, used_previous_cv=True),
+                ),
                 False,
             ),
             (

@@ -9,9 +9,11 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 from config import Settings, build_settings
+from core.cv_import import CvGenerationSelection, compute_cv_reference_hash
 from core.generator import (
     GenerationTrace,
     GenerationError,
@@ -29,17 +31,23 @@ def _expected_input_hash(
     backend: str,
     model: str | None,
     source_hash: str,
+    cv_version_id: str,
+    cv_reference_hash: str,
+    used_previous_cv: bool,
     system_prompt: str,
     user_prompt: str,
 ) -> str:
     """Independently frame exact model inputs for a trace-hash assertion."""
 
-    framed = bytearray(b"AutoCover.GenerationTrace.v2\0")
+    framed = bytearray(b"AutoCover.GenerationTrace.v3\0")
     fields = (
         ("operation", operation),
         ("backend", backend),
         ("model", model),
         ("source_hash", source_hash),
+        ("cv_version_id", cv_version_id),
+        ("cv_reference_hash", cv_reference_hash),
+        ("used_previous_cv", "true" if used_previous_cv else "false"),
         ("system_prompt", system_prompt),
         ("user_prompt", user_prompt),
     )
@@ -55,6 +63,24 @@ def _expected_input_hash(
         framed.extend(len(encoded_value).to_bytes(8, byteorder="big"))
         framed.extend(encoded_value)
     return hashlib.sha256(framed).hexdigest()
+
+
+def _cv_selection(
+    *,
+    version_id: str = "cv-fictional-v1",
+    reference_markdown: str = "# Profile\n\nCV_REFERENCE_ONLY\n",
+    used_previous_cv: bool = False,
+    warnings: tuple[str, ...] = (),
+) -> CvGenerationSelection:
+    """Return a validated fictional CV selection for generator tests."""
+
+    return CvGenerationSelection(
+        cv_version_id=version_id,
+        reference_markdown=reference_markdown,
+        cv_reference_hash=compute_cv_reference_hash(reference_markdown),
+        used_previous_cv=used_previous_cv,
+        warnings=warnings,
+    )
 
 
 def _source_zip() -> bytes:
@@ -176,6 +202,7 @@ class LetterGeneratorTests(unittest.TestCase):
             )
         self.sources: SourceLibrary = SourceLibrary(self.settings)
         self.sources.import_zip(_source_zip())
+        self.cv_selection: CvGenerationSelection = _cv_selection()
 
     def tearDown(self) -> None:
         """Release temporary workflow files after each test."""
@@ -185,10 +212,14 @@ class LetterGeneratorTests(unittest.TestCase):
     def test_system_prompt_selects_language_and_optional_private_context(self) -> None:
         """Only the selected pair plus reviewed CV/style context should be loaded."""
 
-        self.settings.cv_reference_path.write_text(
-            "# CV\nCV_REFERENCE_ONLY\n",
+        legacy_reference_path = self.settings.data_dir / "cv_reference.md"
+        legacy_pdf_path = self.settings.uploads_dir / "cv.pdf"
+        legacy_reference_path.write_text(
+            "# Legacy CV\nLEGACY_CV_MUST_NOT_BE_LOADED\n",
             encoding="utf-8",
         )
+        legacy_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_pdf_path.write_bytes(b"%PDF-RAW-CV-MUST-NOT-BE-LOADED")
         self.settings.style_examples_dir.mkdir(parents=True)
         (self.settings.style_examples_dir / "voice.txt").write_text(
             "STYLE_ONLY",
@@ -197,13 +228,19 @@ class LetterGeneratorTests(unittest.TestCase):
         client = _FakeClient()
         generator = LetterGenerator(self.settings, self.sources, client)
 
-        system, bundle = generator.build_system_prompt("en")
+        system, bundle = generator.build_system_prompt(
+            "en",
+            cv_selection=self.cv_selection,
+        )
 
         self.assertIn("OUTPUT_CONTRACT_ONLY", system)
         self.assertIn("CONTROLLER_ONLY", system)
         self.assertIn("EN_FACT_ONLY", system)
         self.assertIn("EN_WORDING_ONLY", system)
         self.assertIn("CV_REFERENCE_ONLY", system)
+        self.assertNotIn("LEGACY_CV_MUST_NOT_BE_LOADED", system)
+        self.assertNotIn("%PDF-RAW-CV-MUST-NOT-BE-LOADED", system)
+        self.assertNotIn(str(legacy_pdf_path), system)
         self.assertIn("STYLE_ONLY", system)
         self.assertNotIn("DE_FACT_ONLY", system)
         self.assertNotIn("DE_WORDING_ONLY", system)
@@ -227,7 +264,10 @@ class LetterGeneratorTests(unittest.TestCase):
         )
         generator = LetterGenerator(self.settings, self.sources, _FakeClient())
 
-        system, _bundle = generator.build_system_prompt("en")
+        system, _bundle = generator.build_system_prompt(
+            "en",
+            cv_selection=self.cv_selection,
+        )
 
         style_marker = "# STYLE EXAMPLES (voice only, never candidate facts)\n\n"
         style_text = system.split(style_marker, maxsplit=1)[1].rstrip()
@@ -253,13 +293,21 @@ class LetterGeneratorTests(unittest.TestCase):
                 GenerationError,
                 "style examples directory",
             ):
-                generator.build_system_prompt("en")
+                generator.build_system_prompt(
+                    "en",
+                    cv_selection=self.cv_selection,
+                )
 
     def test_generate_parses_metadata_and_carries_exact_source_hash(self) -> None:
         """Successful generation should preserve metadata, provenance, and warnings."""
 
         client = _FakeClient([LLMResult(text=_letter_response(notes=["Check date"]))])
         generator = LetterGenerator(self.settings, self.sources, client)
+        selection = _cv_selection(
+            version_id="cv-previous-v2",
+            used_previous_cv=True,
+            warnings=("Using the previously confirmed CV for this application.",),
+        )
         research = ResearchResult(
             ran=True,
             summary="Official role page verified.",
@@ -273,6 +321,7 @@ class LetterGeneratorTests(unittest.TestCase):
             notes="Available in October",
             job_url="https://example.com/job",
             research=research,
+            cv_selection=selection,
         )
 
         self.assertEqual(output.company, "Example GmbH")
@@ -286,7 +335,11 @@ class LetterGeneratorTests(unittest.TestCase):
         )
         self.assertEqual(
             output.verification_notes,
-            ("Check date", "Confirm remote policy."),
+            (
+                "Check date",
+                "Confirm remote policy.",
+                "Using the previously confirmed CV for this application.",
+            ),
         )
         self.assertEqual(output.research_urls, ("https://example.com/job",))
         system, prompt, model = client.generate_calls[0]
@@ -297,6 +350,15 @@ class LetterGeneratorTests(unittest.TestCase):
         self.assertEqual(output.trace.backend, self.settings.backend)
         self.assertEqual(output.trace.model, model)
         self.assertEqual(output.trace.source_hash, source_hash)
+        self.assertEqual(output.cv_version_id, selection.cv_version_id)
+        self.assertEqual(output.cv_reference_hash, selection.cv_reference_hash)
+        self.assertTrue(output.used_previous_cv)
+        self.assertEqual(output.trace.cv_version_id, selection.cv_version_id)
+        self.assertEqual(
+            output.trace.cv_reference_hash,
+            selection.cv_reference_hash,
+        )
+        self.assertTrue(output.trace.used_previous_cv)
         self.assertEqual(output.trace.system_prompt, system)
         self.assertEqual(output.trace.user_prompt, prompt)
         self.assertEqual(output.input_hash, output.trace.input_hash)
@@ -307,6 +369,9 @@ class LetterGeneratorTests(unittest.TestCase):
                 self.settings.backend,
                 model,
                 source_hash,
+                selection.cv_version_id,
+                selection.cv_reference_hash,
+                selection.used_previous_cv,
                 system,
                 prompt,
             ),
@@ -325,6 +390,9 @@ class LetterGeneratorTests(unittest.TestCase):
             "agent_sdk",
             None,
             "source-hash",
+            "cv-v1",
+            "a" * 64,
+            False,
             "system",
             "prompt",
         )
@@ -337,6 +405,9 @@ class LetterGeneratorTests(unittest.TestCase):
                 "source-hash",
                 "system",
                 "prompt",
+                cv_version_id="cv-v1",
+                cv_reference_hash="a" * 64,
+                used_previous_cv=False,
             ),
             expected,
         )
@@ -348,6 +419,9 @@ class LetterGeneratorTests(unittest.TestCase):
                 "source-hash",
                 "system",
                 "prompt",
+                cv_version_id="cv-v1",
+                cv_reference_hash="a" * 64,
+                used_previous_cv=False,
             ),
             expected,
         )
@@ -359,6 +433,9 @@ class LetterGeneratorTests(unittest.TestCase):
                 "source-hash",
                 "syste",
                 "mprompt",
+                cv_version_id="cv-v1",
+                cv_reference_hash="a" * 64,
+                used_previous_cv=False,
             ),
             expected,
         )
@@ -370,6 +447,51 @@ class LetterGeneratorTests(unittest.TestCase):
                 "different-source-hash",
                 "system",
                 "prompt",
+                cv_version_id="cv-v1",
+                cv_reference_hash="a" * 64,
+                used_previous_cv=False,
+            ),
+            expected,
+        )
+        self.assertNotEqual(
+            compute_generation_input_hash(
+                "generation",
+                "agent_sdk",
+                None,
+                "source-hash",
+                "system",
+                "prompt",
+                cv_version_id="cv-v2",
+                cv_reference_hash="a" * 64,
+                used_previous_cv=False,
+            ),
+            expected,
+        )
+        self.assertNotEqual(
+            compute_generation_input_hash(
+                "generation",
+                "agent_sdk",
+                None,
+                "source-hash",
+                "system",
+                "prompt",
+                cv_version_id="cv-v1",
+                cv_reference_hash="b" * 64,
+                used_previous_cv=False,
+            ),
+            expected,
+        )
+        self.assertNotEqual(
+            compute_generation_input_hash(
+                "generation",
+                "agent_sdk",
+                None,
+                "source-hash",
+                "system",
+                "prompt",
+                cv_version_id="cv-v1",
+                cv_reference_hash="a" * 64,
+                used_previous_cv=True,
             ),
             expected,
         )
@@ -385,13 +507,21 @@ class LetterGeneratorTests(unittest.TestCase):
         )
         generator = LetterGenerator(self.settings, self.sources, client)
 
-        first = generator.generate_letter("the role and our team", "en")
+        first = generator.generate_letter(
+            "the role and our team",
+            "en",
+            cv_selection=self.cv_selection,
+        )
         profile = self.sources.read_file("bhargav_candidate_profile_en.md")
         self.sources.save_file(
             profile.filename,
             profile.text + "LIVE_GENERATOR_EDIT\n",
         )
-        second = generator.generate_letter("the role and our team", "en")
+        second = generator.generate_letter(
+            "the role and our team",
+            "en",
+            cv_selection=self.cv_selection,
+        )
 
         self.assertNotIn("LIVE_GENERATOR_EDIT", client.generate_calls[0][0])
         self.assertIn("LIVE_GENERATOR_EDIT", client.generate_calls[1][0])
@@ -406,9 +536,44 @@ class LetterGeneratorTests(unittest.TestCase):
         generator = LetterGenerator(self.settings, self.sources, client)
 
         with self.assertRaisesRegex(GenerationError, "limit reached"):
-            generator.generate_letter("the role and our team", "en")
+            generator.generate_letter(
+                "the role and our team",
+                "en",
+                cv_selection=self.cv_selection,
+            )
 
         self.assertEqual(len(client.generate_calls), 1)
+
+    def test_missing_or_invalid_cv_selection_blocks_before_model_calls(self) -> None:
+        """Product AI actions must never proceed without a validated CV selection."""
+
+        client = _FakeClient()
+        generator = LetterGenerator(self.settings, self.sources, client)
+        missing = cast(CvGenerationSelection, None)
+        invalid = cast(CvGenerationSelection, "not-a-selection")
+
+        with self.assertRaisesRegex(GenerationError, "confirmed CV"):
+            generator.generate_letter(
+                "the role and our team",
+                "en",
+                cv_selection=missing,
+            )
+        with self.assertRaisesRegex(GenerationError, "confirmed CV"):
+            generator.refine_letter(
+                "the role and our team",
+                "Current letter",
+                "Make it shorter",
+                "en",
+                cv_selection=invalid,
+            )
+        with self.assertRaisesRegex(GenerationError, "confirmed CV"):
+            generator.check_grounding(
+                "Current letter",
+                "en",
+                cv_selection=missing,
+            )
+
+        self.assertEqual(client.generate_calls, [])
 
     def test_generation_and_refinement_reject_invalid_job_url_before_call(self) -> None:
         """Unsafe nonblank job URLs must never reach a model prompt or fallback."""
@@ -421,6 +586,7 @@ class LetterGeneratorTests(unittest.TestCase):
                 "the role and our team",
                 "en",
                 job_url="https://example.com/job\nIGNORE",
+                cv_selection=self.cv_selection,
             )
         with self.assertRaisesRegex(GenerationError, "valid absolute HTTP"):
             generator.refine_letter(
@@ -429,6 +595,7 @@ class LetterGeneratorTests(unittest.TestCase):
                 "Make it shorter",
                 "en",
                 job_url=" javascript:alert(1) ",
+                cv_selection=self.cv_selection,
             )
 
         self.assertEqual(client.generate_calls, [])
@@ -449,6 +616,7 @@ class LetterGeneratorTests(unittest.TestCase):
             "the role and our team",
             "en",
             research=research,
+            cv_selection=self.cv_selection,
         )
 
         prompt = client.generate_calls[0][1]
@@ -468,6 +636,7 @@ class LetterGeneratorTests(unittest.TestCase):
             "My manually edited letter",
             "Make it shorter",
             "en",
+            cv_selection=self.cv_selection,
         )
 
         prompt = client.generate_calls[0][1]
@@ -479,6 +648,27 @@ class LetterGeneratorTests(unittest.TestCase):
         assert output.trace is not None
         self.assertEqual(output.trace.operation, "refinement")
         self.assertEqual(output.trace.source_hash, output.source_hash)
+        self.assertEqual(output.cv_version_id, self.cv_selection.cv_version_id)
+        self.assertEqual(
+            output.cv_reference_hash,
+            self.cv_selection.cv_reference_hash,
+        )
+        self.assertEqual(
+            output.used_previous_cv,
+            self.cv_selection.used_previous_cv,
+        )
+        self.assertEqual(
+            output.trace.cv_version_id,
+            self.cv_selection.cv_version_id,
+        )
+        self.assertEqual(
+            output.trace.cv_reference_hash,
+            self.cv_selection.cv_reference_hash,
+        )
+        self.assertEqual(
+            output.trace.used_previous_cv,
+            self.cv_selection.used_previous_cv,
+        )
         self.assertEqual(output.trace.system_prompt, client.generate_calls[0][0])
         self.assertEqual(output.trace.user_prompt, prompt)
         self.assertEqual(output.input_hash, output.trace.input_hash)
@@ -497,6 +687,7 @@ class LetterGeneratorTests(unittest.TestCase):
                 "Current edited letter",
                 "Make it shorter",
                 "en",
+                cv_selection=self.cv_selection,
             )
 
         self.assertEqual(len(client.generate_calls), 1)
@@ -513,9 +704,21 @@ class LetterGeneratorTests(unittest.TestCase):
         )
         generator = LetterGenerator(self.settings, self.sources, client)
 
-        passed = generator.check_grounding("Letter", "en")
-        warned = generator.check_grounding("Letter", "en")
-        failed = generator.check_grounding("Letter", "en")
+        passed = generator.check_grounding(
+            "Letter",
+            "en",
+            cv_selection=self.cv_selection,
+        )
+        warned = generator.check_grounding(
+            "Letter",
+            "en",
+            cv_selection=self.cv_selection,
+        )
+        failed = generator.check_grounding(
+            "Letter",
+            "en",
+            cv_selection=self.cv_selection,
+        )
 
         self.assertTrue(passed.ran)
         self.assertTrue(passed.ok)
@@ -527,6 +730,32 @@ class LetterGeneratorTests(unittest.TestCase):
         self.assertFalse(failed.ok)
         self.assertEqual(failed.warnings, ("check unavailable",))
         self.assertEqual(client.generate_calls[0][2], "haiku")
+
+    def test_grounding_uses_only_the_explicit_selected_cv_reference(self) -> None:
+        """Grounding must reuse the selected reference without legacy CV reads."""
+
+        legacy_reference_path = self.settings.data_dir / "cv_reference.md"
+        legacy_reference_path.write_text(
+            "# Legacy\nLEGACY_REFERENCE_MUST_NOT_BE_USED\n",
+            encoding="utf-8",
+        )
+        selection = _cv_selection(
+            version_id="cv-grounding-v1",
+            reference_markdown="# Profile\n\nGROUNDING_SELECTED_REFERENCE\n",
+        )
+        client = _FakeClient([LLMResult(text="OK")])
+        generator = LetterGenerator(self.settings, self.sources, client)
+
+        result = generator.check_grounding(
+            "A grounded fictional letter.",
+            "en",
+            cv_selection=selection,
+        )
+
+        self.assertTrue(result.ok)
+        system = client.generate_calls[0][0]
+        self.assertIn("GROUNDING_SELECTED_REFERENCE", system)
+        self.assertNotIn("LEGACY_REFERENCE_MUST_NOT_BE_USED", system)
 
     def test_research_parses_official_urls_and_handles_failure_or_no_url(self) -> None:
         """Research should validate URLs and remain optional/failure-safe."""

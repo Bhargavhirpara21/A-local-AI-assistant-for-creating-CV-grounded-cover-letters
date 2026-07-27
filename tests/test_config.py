@@ -30,6 +30,35 @@ class SettingsTests(unittest.TestCase):
                 settings.applications_path,
                 root / "data" / "applications.xlsx",
             )
+            self.assertEqual(settings.cv_dir, root / "data" / "cv")
+            self.assertEqual(
+                settings.cv_versions_dir,
+                root / "data" / "cv" / "versions",
+            )
+            self.assertEqual(
+                settings.cv_staging_dir,
+                root / "data" / "cv" / "staging",
+            )
+            self.assertEqual(
+                settings.cv_active_path,
+                root / "data" / "cv" / "active.json",
+            )
+            self.assertEqual(
+                settings.cv_pending_path,
+                root / "data" / "cv" / "pending.json",
+            )
+            self.assertEqual(
+                settings.cv_pending_recovery_path,
+                root / "data" / "cv" / "pending.recovery.json",
+            )
+            self.assertFalse(hasattr(settings, "cv_pdf_path"))
+            self.assertFalse(hasattr(settings, "cv_reference_path"))
+            self.assertFalse(hasattr(settings, "cv_metadata_path"))
+            self.assertEqual(settings.max_cv_pdf_bytes, 25 * 1024 * 1024)
+            self.assertEqual(
+                settings.cv_import_max_buffer_bytes,
+                64 * 1024 * 1024,
+            )
             self.assertEqual(settings.letters_dir, root / "letters")
 
     def test_settings_are_frozen(self) -> None:
@@ -56,6 +85,9 @@ class SettingsTests(unittest.TestCase):
                 settings.source_library_dir,
                 settings.uploads_dir,
                 settings.cache_dir,
+                settings.cv_dir,
+                settings.cv_versions_dir,
+                settings.cv_staging_dir,
                 settings.letters_dir,
             )
             self.assertTrue(all(path.is_dir() for path in expected_directories))

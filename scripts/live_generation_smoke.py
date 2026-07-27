@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast
 
 from config import Settings, build_settings, ensure_dirs
+from core.cv_import import CvGenerationSelection, compute_cv_reference_hash
 from core.generator import LetterGenerator, LetterOutput
 from core.language import detect_language
 from core.source_library import Language, SourceLibrary
@@ -55,15 +56,24 @@ def main(language_filter: Language | None = None) -> int:
         )
         client = get_client(settings)
         generator = LetterGenerator(settings, sources, client)
+        cv_selection = _synthetic_cv_selection()
         cases = tuple(
             case
             for case in _smoke_cases()
             if language_filter is None or case.language == language_filter
         )
         for case in cases:
-            output = generator.generate_letter(case.job_text, case.language)
-            _validate_output(output, case, sources)
-            grounding = generator.check_grounding(output.letter, case.language)
+            output = generator.generate_letter(
+                case.job_text,
+                case.language,
+                cv_selection=cv_selection,
+            )
+            _validate_output(output, case, sources, cv_selection)
+            grounding = generator.check_grounding(
+                output.letter,
+                case.language,
+                cv_selection=cv_selection,
+            )
             if not grounding.ran:
                 raise RuntimeError(
                     f"{case.language} grounding check could not execute."
@@ -90,6 +100,7 @@ def _isolated_settings(temporary_root: Path) -> Settings:
     private_data = temporary_root / "data"
     uploads = private_data / "uploads"
     cache = private_data / "cache"
+    cv_dir = private_data / "cv"
     return replace(
         base,
         style_examples_dir=temporary_root / "style_examples",
@@ -98,11 +109,33 @@ def _isolated_settings(temporary_root: Path) -> Settings:
         uploads_dir=uploads,
         cache_dir=cache,
         letters_dir=temporary_root / "letters",
-        cv_pdf_path=uploads / "cv.pdf",
-        cv_reference_path=private_data / "cv_reference.md",
-        cv_metadata_path=private_data / "cv_reference.json",
+        cv_dir=cv_dir,
+        cv_versions_dir=cv_dir / "versions",
+        cv_staging_dir=cv_dir / "staging",
+        cv_active_path=cv_dir / "active.json",
+        cv_pending_path=cv_dir / "pending.json",
+        cv_pending_recovery_path=cv_dir / "pending.recovery.json",
         applications_path=private_data / "applications.xlsx",
         system_prompt_cache_path=cache / "last_system_prompt.md",
+    )
+
+
+def _synthetic_cv_selection() -> CvGenerationSelection:
+    """Return an explicit validated CV selection containing fictional data only."""
+
+    reference_markdown = (
+        "# Profile\n\n"
+        "Fictional CV reference for pipeline testing. "
+        "Avery Morgan is a fictional junior software engineer based in Munich. "
+        "This synthetic reference exists only to verify explicit CV selection "
+        "and contains no personal project data.\n"
+    )
+    return CvGenerationSelection(
+        cv_version_id="fictional-smoke-cv-v1",
+        reference_markdown=reference_markdown,
+        cv_reference_hash=compute_cv_reference_hash(reference_markdown),
+        used_previous_cv=False,
+        warnings=(),
     )
 
 
@@ -241,6 +274,7 @@ def _validate_output(
     output: LetterOutput,
     case: SmokeCase,
     sources: SourceLibrary,
+    cv_selection: CvGenerationSelection,
 ) -> None:
     if output.language != case.language:
         raise RuntimeError(f"{case.language} output used the wrong language.")
@@ -250,6 +284,12 @@ def _validate_output(
         raise RuntimeError(f"{case.language} output parsed the wrong role.")
     if output.source_hash != sources.load_bundle(case.language).sha256:
         raise RuntimeError(f"{case.language} output has the wrong source hash.")
+    if output.cv_version_id != cv_selection.cv_version_id:
+        raise RuntimeError(f"{case.language} output has the wrong CV version.")
+    if output.cv_reference_hash != cv_selection.cv_reference_hash:
+        raise RuntimeError(f"{case.language} output has the wrong CV reference hash.")
+    if output.used_previous_cv != cv_selection.used_previous_cv:
+        raise RuntimeError(f"{case.language} output has the wrong CV fallback flag.")
     for phrase in case.required_phrases:
         if phrase not in output.letter:
             raise RuntimeError(
